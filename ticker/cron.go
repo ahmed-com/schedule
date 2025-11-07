@@ -81,9 +81,9 @@ func (t *CronTicker) run() {
 			select {
 			case <-t.stopCh:
 				return
-			case resume := <-t.pauseCh:
+			case shouldPause := <-t.pauseCh:
 				t.mu.Lock()
-				t.paused = !resume
+				t.paused = shouldPause
 				t.mu.Unlock()
 			}
 			continue

@@ -292,7 +292,7 @@ func (t *ISO8601Ticker) GetOccurrencesBetween(start, end time.Time) ([]time.Time
 			break
 		}
 
-		if current.After(start) && t.isWithinWindow(current) {
+		if (current.After(start) || current.Equal(start)) && t.isWithinWindow(current) {
 			occurrences = append(occurrences, current)
 		}
 

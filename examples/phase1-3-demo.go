@@ -13,7 +13,8 @@ import (
 )
 
 func main() {
-	fmt.Println("=== Jobistemer Phase 1-3 Demo ===\n")
+	fmt.Println("=== Jobistemer Phase 1-3 Demo ===")
+	fmt.Println()
 
 	// Phase 1: Demonstrate deterministic ID generation
 	fmt.Println("Phase 1: Deterministic ID Generation")
@@ -41,7 +42,7 @@ func main() {
 	fmt.Println("----------------------------------")
 	
 	// Create temporary directory for BadgerDB
-	dbPath := "/tmp/jobistemer-demo"
+	dbPath := fmt.Sprintf("/tmp/jobistemer-demo-%d", time.Now().UnixNano())
 	store, err := badger.NewBadgerStorage(dbPath)
 	if err != nil {
 		log.Fatalf("Failed to create storage: %v", err)
