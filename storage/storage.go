@@ -3,6 +3,8 @@ package storage
 import (
 	"context"
 	"time"
+	
+	"github.com/ahmed-com/schedule"
 )
 
 // Storage defines the interface for persisting job scheduling metadata and state
@@ -47,31 +49,6 @@ type Storage interface {
 	Close() error
 }
 
-// JobStatus represents the status of a job occurrence
-type JobStatus string
-
-const (
-	JobStatusPending      JobStatus = "Pending"
-	JobStatusRunning      JobStatus = "Running"
-	JobStatusCompleted    JobStatus = "Completed"
-	JobStatusFailed       JobStatus = "Failed"
-	JobStatusCanceled     JobStatus = "Canceled"
-	JobStatusFailedStale  JobStatus = "Failed_Stale"
-	JobStatusQueued       JobStatus = "Queued"
-)
-
-// TaskStatus represents the status of a task run or execution attempt
-type TaskStatus string
-
-const (
-	TaskStatusPending  TaskStatus = "Pending"
-	TaskStatusRunning  TaskStatus = "Running"
-	TaskStatusSuccess  TaskStatus = "Success"
-	TaskStatusFailed   TaskStatus = "Failed"
-	TaskStatusCanceled TaskStatus = "Canceled"
-	TaskStatusTimeout  TaskStatus = "Timeout"
-)
-
 // Job represents a job definition in storage
 type Job struct {
 	ID             string
@@ -104,7 +81,7 @@ type JobOccurrence struct {
 	JobID         string
 	JobVersion    int64
 	ScheduledTime time.Time
-	Status        JobStatus
+	Status        jobistemer.JobStatus
 	OwningNodeID  string
 	StartTime     *time.Time
 	EndTime       *time.Time
@@ -119,7 +96,7 @@ type TaskRun struct {
 	ID           string
 	OccurrenceID string
 	TaskID       string
-	Status       TaskStatus
+	Status       jobistemer.TaskStatus
 	RetryCount   int
 	StartTime    *time.Time
 	EndTime      *time.Time
@@ -133,7 +110,7 @@ type ExecutionAttempt struct {
 	ID            string
 	TaskRunID     string
 	AttemptNumber int
-	Status        TaskStatus
+	Status        jobistemer.TaskStatus
 	StartTime     time.Time
 	EndTime       *time.Time
 	ErrorMessage  string

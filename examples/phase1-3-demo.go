@@ -6,6 +6,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/ahmed-com/schedule"
 	"github.com/ahmed-com/schedule/id"
 	"github.com/ahmed-com/schedule/storage"
 	"github.com/ahmed-com/schedule/storage/badger"
@@ -100,7 +101,7 @@ func main() {
 		JobID:         jobID,
 		JobVersion:    1,
 		ScheduledTime: scheduledTime,
-		Status:        storage.JobStatusPending,
+		Status:        jobistemer.JobStatusPending,
 		Config:        []byte(`{}`),
 		IsRecoveryRun: false,
 		CreatedAt:     time.Now(),

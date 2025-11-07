@@ -4,6 +4,9 @@ import (
 	"time"
 )
 
+// MaxOccurrenceIterations is the safety limit for occurrence calculations
+const MaxOccurrenceIterations = 10000
+
 // ExecutionContext provides timing and transaction info for task execution
 type ExecutionContext struct {
 	ScheduledTime time.Time

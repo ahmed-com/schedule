@@ -300,7 +300,7 @@ func (t *ISO8601Ticker) GetOccurrencesBetween(start, end time.Time) ([]time.Time
 		count++
 
 		// Safety check
-		if count > 100000 {
+		if count > MaxOccurrenceIterations {
 			return nil, fmt.Errorf("too many occurrences")
 		}
 	}

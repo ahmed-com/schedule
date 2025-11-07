@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ahmed-com/schedule"
 	"github.com/ahmed-com/schedule/storage"
 	"github.com/dgraph-io/badger/v4"
 )
@@ -416,7 +417,7 @@ func (s *BadgerStorage) ListRunningOccurrences(ctx context.Context) ([]*storage.
 				if err := json.Unmarshal(val, &occ); err != nil {
 					return err
 				}
-				if occ.Status == storage.JobStatusRunning {
+				if occ.Status == jobistemer.JobStatusRunning {
 					occurrences = append(occurrences, &occ)
 				}
 				return nil
@@ -455,7 +456,7 @@ func (s *BadgerStorage) ListStaleOccurrences(ctx context.Context, threshold time
 				if err := json.Unmarshal(val, &occ); err != nil {
 					return err
 				}
-				if occ.Status == storage.JobStatusRunning && occ.StartTime != nil && occ.StartTime.Before(cutoff) {
+				if occ.Status == jobistemer.JobStatusRunning && occ.StartTime != nil && occ.StartTime.Before(cutoff) {
 					occurrences = append(occurrences, &occ)
 				}
 				return nil
@@ -489,7 +490,7 @@ func (s *BadgerStorage) ListQueuedOccurrencesByJobID(ctx context.Context, jobID 
 				if err := json.Unmarshal(val, &occ); err != nil {
 					return err
 				}
-				if occ.Status == storage.JobStatusQueued {
+				if occ.Status == jobistemer.JobStatusQueued {
 					occurrences = append(occurrences, &occ)
 				}
 				return nil

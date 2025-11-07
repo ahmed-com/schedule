@@ -241,7 +241,7 @@ func (t *CronTicker) GetOccurrencesBetween(start, end time.Time) ([]time.Time, e
 	end = end.In(t.location)
 
 	// Limit iterations to prevent infinite loops
-	maxIterations := 10000
+	maxIterations := MaxOccurrenceIterations
 	iterations := 0
 
 	for current.Before(end) {
