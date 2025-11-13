@@ -107,6 +107,7 @@ type SchedulerConfig struct {
 	MaxConcurrentJobs int           `json:"max_concurrent_jobs"`
 	ReaperInterval    time.Duration `json:"reaper_interval"`
 	NodeID            string        `json:"node_id"`
+	Metrics           interface{}   `json:"-"` // MetricsCollector interface (not serialized)
 }
 
 // ExecutionContext provides context information for task execution

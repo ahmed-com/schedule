@@ -11,6 +11,7 @@ import (
 	"github.com/ahmed-com/schedule/concurrency"
 	"github.com/ahmed-com/schedule/executor"
 	"github.com/ahmed-com/schedule/id"
+	"github.com/ahmed-com/schedule/metrics"
 	"github.com/ahmed-com/schedule/recovery"
 	"github.com/ahmed-com/schedule/storage"
 	"github.com/ahmed-com/schedule/ticker"
@@ -18,11 +19,12 @@ import (
 
 // Scheduler is the main orchestrator for job scheduling and execution
 type Scheduler struct {
-	config jobistemer.SchedulerConfig
-	store  storage.Storage
-	exec   *executor.Executor
-	pool   *concurrency.WorkerPool
-	reaper *recovery.Reaper
+	config  jobistemer.SchedulerConfig
+	store   storage.Storage
+	exec    *executor.Executor
+	pool    *concurrency.WorkerPool
+	reaper  *recovery.Reaper
+	metrics metrics.MetricsCollector
 
 	jobs   map[string]*jobistemer.Job
 	jobsMu sync.RWMutex
@@ -43,15 +45,30 @@ func NewScheduler(config jobistemer.SchedulerConfig, store storage.Storage) *Sch
 	pool := concurrency.NewWorkerPool(config.MaxConcurrentJobs)
 	reaper := recovery.NewReaper(store, config.ReaperInterval)
 
+	// Use provided metrics collector or default to NoOp
+	metricsCollector := config.Metrics
+	if metricsCollector == nil {
+		metricsCollector = metrics.NewNoOpMetrics()
+	}
+	// Type assert to ensure it implements MetricsCollector
+	mc, ok := metricsCollector.(metrics.MetricsCollector)
+	if !ok {
+		mc = metrics.NewNoOpMetrics()
+	}
+
+	// Pass metrics to executor
+	exec.SetMetrics(mc)
+
 	return &Scheduler{
-		config: config,
-		store:  store,
-		exec:   exec,
-		pool:   pool,
-		reaper: reaper,
-		jobs:   make(map[string]*jobistemer.Job),
-		ctx:    ctx,
-		cancel: cancel,
+		config:  config,
+		store:   store,
+		exec:    exec,
+		pool:    pool,
+		reaper:  reaper,
+		metrics: mc,
+		jobs:    make(map[string]*jobistemer.Job),
+		ctx:     ctx,
+		cancel:  cancel,
 	}
 }
 
@@ -263,6 +280,7 @@ func (s *Scheduler) performRecovery() error {
 	defer s.jobsMu.RUnlock()
 
 	recoveryHandler := recovery.NewRecoveryHandler(s.store, s.exec, s.pool)
+	recoveryHandler.SetMetrics(s.metrics)
 
 	for _, job := range s.jobs {
 		if !job.Active {
@@ -360,4 +378,28 @@ func (s *Scheduler) ListJobs() []*jobistemer.Job {
 		jobs = append(jobs, job)
 	}
 	return jobs
+}
+
+// updateMetrics updates metrics gauges based on current system state
+func (s *Scheduler) updateMetrics() {
+	// Count running occurrences
+	runningOccs, err := s.store.ListRunningOccurrences(s.ctx)
+	if err == nil {
+		s.metrics.SetJobsRunning(len(runningOccs))
+	}
+
+	// Count queued jobs (jobs in worker pool queue)
+	queueLen := s.pool.QueueLength()
+	s.metrics.SetJobsInQueue(queueLen)
+
+	// Count paused jobs
+	s.jobsMu.RLock()
+	pausedCount := 0
+	for _, job := range s.jobs {
+		if job.Paused {
+			pausedCount++
+		}
+	}
+	s.jobsMu.RUnlock()
+	s.metrics.SetJobsPaused(pausedCount)
 }
