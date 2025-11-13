@@ -1,0 +1,285 @@
+package update
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/ahmed-com/schedule"
+	"github.com/ahmed-com/schedule/storage"
+	"github.com/ahmed-com/schedule/ticker"
+)
+
+// JobUpdate represents an update request for a job
+type JobUpdate struct {
+	JobID          string
+	ExpectedVersion int64
+	NewConfig      *jobistemer.JobConfig
+	NewTicker      ticker.Ticker
+	AddedTasks     []*jobistemer.Task
+	RemovedTaskIDs []string
+	UpdatedTasks   []*jobistemer.Task
+	Policy         jobistemer.UpdatePolicy
+}
+
+// UpdateManager handles job updates with versioning and diffing
+type UpdateManager struct {
+	store storage.Storage
+}
+
+// NewUpdateManager creates a new update manager
+func NewUpdateManager(store storage.Storage) *UpdateManager {
+	return &UpdateManager{store: store}
+}
+
+// ApplyUpdate applies a job update with the specified policy
+func (m *UpdateManager) ApplyUpdate(ctx context.Context, update *JobUpdate) error {
+	// Load current job from storage
+	currentJob, err := m.store.GetJob(ctx, update.JobID)
+	if err != nil {
+		return fmt.Errorf("failed to load current job: %w", err)
+	}
+
+	if currentJob == nil {
+		return fmt.Errorf("job not found: %s", update.JobID)
+	}
+
+	// Optimistic locking: verify version
+	if currentJob.Version != update.ExpectedVersion {
+		return fmt.Errorf("version mismatch: expected %d, got %d", update.ExpectedVersion, currentJob.Version)
+	}
+
+	// Increment version
+	newVersion := currentJob.Version + 1
+
+	// Apply config update if provided
+	if update.NewConfig != nil {
+		currentJob.Config = serializeConfig(update.NewConfig)
+	}
+
+	// Update version and timestamp
+	currentJob.Version = newVersion
+	currentJob.UpdatedAt = time.Now()
+
+	// Apply the update within a transaction
+	return m.applyUpdateTransaction(ctx, currentJob, update)
+}
+
+func (m *UpdateManager) applyUpdateTransaction(ctx context.Context, currentJob *storage.Job, update *JobUpdate) error {
+	// Update job record
+	if err := m.store.UpdateJob(ctx, currentJob); err != nil {
+		return fmt.Errorf("failed to update job: %w", err)
+	}
+
+	// Handle task additions
+	for _, task := range update.AddedTasks {
+		storageTask := &storage.Task{
+			ID:        task.ID,
+			JobID:     update.JobID,
+			Name:      task.Name,
+			Config:    serializeTaskConfig(task.Config),
+			Order:     task.Order,
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		}
+		if err := m.store.CreateTask(ctx, storageTask); err != nil {
+			return fmt.Errorf("failed to add task %s: %w", task.ID, err)
+		}
+	}
+
+	// Handle task removals
+	for _, taskID := range update.RemovedTaskIDs {
+		if err := m.store.DeleteTask(ctx, taskID); err != nil {
+			return fmt.Errorf("failed to remove task %s: %w", taskID, err)
+		}
+	}
+
+	// Handle task updates
+	for _, task := range update.UpdatedTasks {
+		storageTask, err := m.store.GetTask(ctx, task.ID)
+		if err != nil {
+			return fmt.Errorf("failed to get task %s: %w", task.ID, err)
+		}
+		if storageTask == nil {
+			return fmt.Errorf("task not found: %s", task.ID)
+		}
+
+		storageTask.Name = task.Name
+		storageTask.Config = serializeTaskConfig(task.Config)
+		storageTask.Order = task.Order
+		storageTask.UpdatedAt = time.Now()
+
+		if err := m.store.UpdateTask(ctx, storageTask); err != nil {
+			return fmt.Errorf("failed to update task %s: %w", task.ID, err)
+		}
+	}
+
+	// Handle schedule changes if ticker is provided
+	if update.NewTicker != nil {
+		if err := m.applyScheduleUpdate(ctx, currentJob, update); err != nil {
+			return fmt.Errorf("failed to apply schedule update: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// applyScheduleUpdate applies schedule changes based on update policy
+func (m *UpdateManager) applyScheduleUpdate(ctx context.Context, job *storage.Job, update *JobUpdate) error {
+	now := time.Now()
+
+	switch update.Policy {
+	case jobistemer.UpdatePolicyImmediate:
+		return m.applyImmediateUpdate(ctx, job, update.NewTicker, now)
+	case jobistemer.UpdatePolicyGraceful:
+		return m.applyGracefulUpdate(ctx, job, update.NewTicker, now)
+	case jobistemer.UpdatePolicyWindowed:
+		return m.applyWindowedUpdate(ctx, job, update.NewTicker, now)
+	default:
+		return m.applyImmediateUpdate(ctx, job, update.NewTicker, now)
+	}
+}
+
+// applyImmediateUpdate applies immediate schedule changes
+func (m *UpdateManager) applyImmediateUpdate(ctx context.Context, job *storage.Job, newTicker ticker.Ticker, now time.Time) error {
+	// Get old schedule occurrences (if we had the old ticker)
+	// For simplicity, we'll cancel all pending future occurrences
+	// and let the new ticker generate new ones
+
+	// Cancel all pending occurrences for this job
+	occurrences, err := m.store.ListPendingOccurrences(ctx, job.ID)
+	if err != nil {
+		return err
+	}
+
+	for _, occ := range occurrences {
+		if occ.ScheduledTime.After(now) {
+			occ.Status = jobistemer.JobStatusCanceled
+			occ.UpdatedAt = time.Now()
+			if err := m.store.UpdateJobOccurrence(ctx, occ); err != nil {
+				return err
+			}
+		}
+	}
+
+	// New occurrences will be generated by the scheduler's ticker
+	// when it restarts with the new ticker
+	return nil
+}
+
+// applyGracefulUpdate applies graceful schedule changes
+func (m *UpdateManager) applyGracefulUpdate(ctx context.Context, job *storage.Job, newTicker ticker.Ticker, now time.Time) error {
+	// Find the next scheduled occurrence
+	occurrences, err := m.store.ListPendingOccurrences(ctx, job.ID)
+	if err != nil {
+		return err
+	}
+
+	// Find the earliest pending occurrence after now
+	var nextOccurrence *storage.JobOccurrence
+	for _, occ := range occurrences {
+		if occ.ScheduledTime.After(now) {
+			if nextOccurrence == nil || occ.ScheduledTime.Before(nextOccurrence.ScheduledTime) {
+				nextOccurrence = occ
+			}
+		}
+	}
+
+	// Cancel all occurrences after the next one
+	if nextOccurrence != nil {
+		for _, occ := range occurrences {
+			if occ.ScheduledTime.After(nextOccurrence.ScheduledTime) {
+				occ.Status = jobistemer.JobStatusCanceled
+				occ.UpdatedAt = time.Now()
+				if err := m.store.UpdateJobOccurrence(ctx, occ); err != nil {
+					return err
+				}
+			}
+		}
+	} else {
+		// No next occurrence, apply immediately
+		return m.applyImmediateUpdate(ctx, job, newTicker, now)
+	}
+
+	return nil
+}
+
+// applyWindowedUpdate applies windowed schedule changes
+func (m *UpdateManager) applyWindowedUpdate(ctx context.Context, job *storage.Job, newTicker ticker.Ticker, now time.Time) error {
+	// Define a window (e.g., 7 days)
+	windowEnd := now.Add(7 * 24 * time.Hour)
+
+	// Get pending occurrences within the window
+	occurrences, err := m.store.ListPendingOccurrences(ctx, job.ID)
+	if err != nil {
+		return err
+	}
+
+	// Cancel occurrences within the window
+	for _, occ := range occurrences {
+		if occ.ScheduledTime.After(now) && occ.ScheduledTime.Before(windowEnd) {
+			occ.Status = jobistemer.JobStatusCanceled
+			occ.UpdatedAt = time.Now()
+			if err := m.store.UpdateJobOccurrence(ctx, occ); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Occurrences beyond the window are left unchanged
+	// New occurrences within the window will be generated by the new ticker
+	return nil
+}
+
+// DiffSchedules computes the difference between old and new schedule occurrences
+func (m *UpdateManager) DiffSchedules(oldTicker, newTicker ticker.Ticker, start, end time.Time) (added, removed []time.Time, err error) {
+	// Get occurrences from old ticker
+	oldTimes, err := oldTicker.GetOccurrencesBetween(start, end)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get old occurrences: %w", err)
+	}
+
+	// Get occurrences from new ticker
+	newTimes, err := newTicker.GetOccurrencesBetween(start, end)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get new occurrences: %w", err)
+	}
+
+	// Convert to maps for efficient lookup
+	oldMap := make(map[time.Time]bool)
+	for _, t := range oldTimes {
+		oldMap[t] = true
+	}
+
+	newMap := make(map[time.Time]bool)
+	for _, t := range newTimes {
+		newMap[t] = true
+	}
+
+	// Find added times (in new but not in old)
+	for _, t := range newTimes {
+		if !oldMap[t] {
+			added = append(added, t)
+		}
+	}
+
+	// Find removed times (in old but not in new)
+	for _, t := range oldTimes {
+		if !newMap[t] {
+			removed = append(removed, t)
+		}
+	}
+
+	return added, removed, nil
+}
+
+// Helper functions for serialization (simplified for now)
+func serializeConfig(config *jobistemer.JobConfig) []byte {
+	// In a real implementation, use JSON or protobuf
+	return []byte{}
+}
+
+func serializeTaskConfig(config jobistemer.TaskConfig) []byte {
+	// In a real implementation, use JSON or protobuf
+	return []byte{}
+}

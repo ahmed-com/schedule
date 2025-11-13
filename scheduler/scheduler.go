@@ -15,6 +15,7 @@ import (
 	"github.com/ahmed-com/schedule/recovery"
 	"github.com/ahmed-com/schedule/storage"
 	"github.com/ahmed-com/schedule/ticker"
+	"github.com/ahmed-com/schedule/update"
 )
 
 // Scheduler is the main orchestrator for job scheduling and execution
@@ -402,4 +403,86 @@ func (s *Scheduler) updateMetrics() {
 	}
 	s.jobsMu.RUnlock()
 	s.metrics.SetJobsPaused(pausedCount)
+}
+
+// UpdateJob updates a registered job with version checking
+func (s *Scheduler) UpdateJob(jobUpdate *update.JobUpdate) error {
+	s.jobsMu.Lock()
+	defer s.jobsMu.Unlock()
+
+	// Check if job exists
+	job, exists := s.jobs[jobUpdate.JobID]
+	if !exists {
+		return fmt.Errorf("job not registered: %s", jobUpdate.JobID)
+	}
+
+	// Verify version matches
+	if job.Version != jobUpdate.ExpectedVersion {
+		return fmt.Errorf("version mismatch: expected %d, got %d", jobUpdate.ExpectedVersion, job.Version)
+	}
+
+	// Create update manager
+	updateMgr := update.NewUpdateManager(s.store)
+
+	// Apply update through update manager
+	if err := updateMgr.ApplyUpdate(s.ctx, jobUpdate); err != nil {
+		return fmt.Errorf("failed to apply update: %w", err)
+	}
+
+	// Update in-memory job if config was changed
+	if jobUpdate.NewConfig != nil {
+		job.Config = *jobUpdate.NewConfig
+	}
+
+	// Update ticker if provided
+	if jobUpdate.NewTicker != nil {
+		// Stop old ticker
+		if job.Ticker != nil {
+			job.Ticker.Stop()
+		}
+		// Set new ticker
+		job.Ticker = jobUpdate.NewTicker
+		// Restart if job is active
+		if job.Active && !job.Paused && s.running {
+			job.Ticker.Start()
+		}
+	}
+
+	// Apply task updates
+	taskMap := make(map[string]*jobistemer.Task)
+	for _, task := range job.Tasks {
+		taskMap[task.ID] = task
+	}
+
+	// Add new tasks
+	for _, task := range jobUpdate.AddedTasks {
+		job.Tasks = append(job.Tasks, task)
+		taskMap[task.ID] = task
+	}
+
+	// Remove tasks
+	for _, taskID := range jobUpdate.RemovedTaskIDs {
+		delete(taskMap, taskID)
+	}
+
+	// Update tasks
+	for _, updatedTask := range jobUpdate.UpdatedTasks {
+		if existingTask, exists := taskMap[updatedTask.ID]; exists {
+			existingTask.Name = updatedTask.Name
+			existingTask.Config = updatedTask.Config
+			existingTask.Order = updatedTask.Order
+		}
+	}
+
+	// Rebuild tasks list from map
+	newTasks := make([]*jobistemer.Task, 0, len(taskMap))
+	for _, task := range taskMap {
+		newTasks = append(newTasks, task)
+	}
+	job.Tasks = newTasks
+
+	// Increment version
+	job.Version++
+
+	return nil
 }

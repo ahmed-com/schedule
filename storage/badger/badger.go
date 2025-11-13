@@ -506,6 +506,40 @@ func (s *BadgerStorage) ListQueuedOccurrencesByJobID(ctx context.Context, jobID 
 	return occurrences, err
 }
 
+func (s *BadgerStorage) ListPendingOccurrences(ctx context.Context, jobID string) ([]*storage.JobOccurrence, error) {
+	var occurrences []*storage.JobOccurrence
+	
+	err := s.db.View(func(txn *badger.Txn) error {
+		prefix := []byte(fmt.Sprintf("job/%s/occurrence/", jobID))
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = prefix
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			
+			err := item.Value(func(val []byte) error {
+				var occ storage.JobOccurrence
+				if err := json.Unmarshal(val, &occ); err != nil {
+					return err
+				}
+				if occ.Status == jobistemer.JobStatusPending {
+					occurrences = append(occurrences, &occ)
+				}
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+		}
+		
+		return nil
+	})
+	
+	return occurrences, err
+}
+
 // TaskRun operations
 
 func (s *BadgerStorage) CreateTaskRun(ctx context.Context, run *storage.TaskRun) error {

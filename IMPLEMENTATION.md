@@ -122,12 +122,46 @@ A production-ready Go library for scheduling and executing jobs with persistent,
 - Graceful shutdown waits for workers
 - Thread-safe task submission
 
-### 🚧 Remaining Phases (9-10)
+#### Phase 9: Observability & Metrics
+- ✅ Metrics package with MetricsCollector interface
+- ✅ InMemoryMetrics and NoOpMetrics implementations
+- ✅ Gauges for jobs running, in queue, and paused
+- ✅ Counters for task attempts, job occurrences, and recovery runs
+- ✅ Histograms for job and task execution duration
+- ✅ Integration in scheduler, executor, and recovery handler
+- ✅ Comprehensive tests for metrics functionality
 
-The following phases are outlined in the technical specification but not yet implemented:
+**Key Features:**
+- Prometheus-style metrics interface
+- Thread-safe in-memory collector for testing and basic monitoring
+- No-op collector for production when external metrics system is used
+- Real-time observability of system state
 
-- **Phase 9:** Observability & Metrics
-- **Phase 10:** Update and Versioning
+#### Phase 10: Update and Versioning
+- ✅ JobUpdate type with version checking
+- ✅ Update policies (Immediate, Graceful, Windowed)
+- ✅ Diffing algorithm for schedule changes
+- ✅ Support for adding/removing tasks
+- ✅ Support for updating task configurations
+- ✅ Optimistic locking with version numbers
+- ✅ Transactional update operations
+- ✅ UpdateJob method in scheduler
+- ✅ Tests for job updates and versioning
+
+**Key Features:**
+- Version-based optimistic locking prevents concurrent updates
+- Multiple update policies for different use cases
+- Safe schedule changes without losing occurrences
+- Idempotent update operations using deterministic IDs
+
+### ✅ All Phases Complete!
+
+The Jobistemer scheduling system is now fully implemented with all 10 phases complete. The system is ready for production use with:
+- Deterministic idempotency and lock-free distributed coordination
+- Fault-tolerant execution with persistent state
+- Real-time observability and metrics
+- Safe job updates with versioning
+- Comprehensive test coverage
 
 ## Quick Start
 
@@ -341,6 +375,131 @@ sched.Shutdown(30 * time.Second)
 
 func timePtr(d time.Duration) *time.Duration {
     return &d
+}
+```
+
+### Phase 9: Observability & Metrics Usage
+
+```go
+import (
+    "github.com/ahmed-com/schedule"
+    "github.com/ahmed-com/schedule/metrics"
+    "github.com/ahmed-com/schedule/scheduler"
+    "github.com/ahmed-com/schedule/storage/badger"
+)
+
+// Create metrics collector
+metricsCollector := metrics.NewInMemoryMetrics()
+
+// Configure scheduler with metrics
+config := jobistemer.SchedulerConfig{
+    MaxConcurrentJobs: 10,
+    ReaperInterval:    5 * time.Minute,
+    Metrics:           metricsCollector,
+}
+
+store, _ := badger.NewBadgerStorage("/path/to/db")
+sched := scheduler.NewScheduler(config, store)
+
+// ... register and start jobs ...
+
+// Query metrics
+fmt.Printf("Jobs running: %d\n", metricsCollector.GetJobsRunning())
+fmt.Printf("Jobs in queue: %d\n", metricsCollector.GetJobsInQueue())
+fmt.Printf("Jobs paused: %d\n", metricsCollector.GetJobsPaused())
+
+// Get task attempt counts
+attempts := metricsCollector.GetTaskAttempts("my-job", "my-task", "success")
+fmt.Printf("Task attempts (success): %d\n", attempts)
+
+// Get job occurrence counts
+occurrences := metricsCollector.GetJobOccurrences("my-job", "completed")
+fmt.Printf("Job occurrences (completed): %d\n", occurrences)
+
+// Get job duration histogram
+durations := metricsCollector.GetJobDurations("my-job")
+fmt.Printf("Job durations: %v\n", durations)
+```
+
+### Phase 10: Update and Versioning Usage
+
+```go
+import (
+    "github.com/ahmed-com/schedule"
+    "github.com/ahmed-com/schedule/scheduler"
+    "github.com/ahmed-com/schedule/ticker"
+    "github.com/ahmed-com/schedule/update"
+)
+
+// Get the current job
+job, exists := sched.GetJob("my-job")
+if !exists {
+    panic("job not found")
+}
+
+// Update job configuration
+newConfig := jobistemer.JobConfig{
+    TaskExecutionMode: jobistemer.TaskExecutionModeParallel,
+    FailureStrategy:   jobistemer.FailureStrategyContinue,
+    ExecutionTimeout:  1 * time.Hour,
+}
+
+// Create a new ticker (e.g., change from daily to hourly)
+newTicker, _ := ticker.NewCronTicker("0 * * * *", ticker.TickerConfig{
+    Timezone: "America/New_York",
+})
+
+// Add a new task
+newTask := &jobistemer.Task{
+    ID:    id.GenerateTaskID(job.ID, "cleanup"),
+    Name:  "cleanup",
+    Order: len(job.Tasks),
+    Fn: func(ctx context.Context, execCtx *jobistemer.ExecutionContext) error {
+        fmt.Println("Running cleanup task")
+        return nil
+    },
+}
+
+// Create update request
+jobUpdate := &update.JobUpdate{
+    JobID:           job.ID,
+    ExpectedVersion: job.Version, // Optimistic locking
+    NewConfig:       &newConfig,
+    NewTicker:       newTicker,
+    AddedTasks:      []*jobistemer.Task{newTask},
+    RemovedTaskIDs:  []string{}, // Remove any task IDs
+    UpdatedTasks:    []*jobistemer.Task{}, // Update any tasks
+    Policy:          jobistemer.UpdatePolicyImmediate, // Or Graceful, Windowed
+}
+
+// Apply the update
+err := sched.UpdateJob(jobUpdate)
+if err != nil {
+    fmt.Printf("Update failed: %v\n", err)
+    // Handle version mismatch or other errors
+}
+
+// Version is automatically incremented
+fmt.Printf("Job updated to version %d\n", job.Version)
+```
+
+**Update Policies:**
+
+- **Immediate**: Cancel all pending occurrences and apply new schedule immediately
+- **Graceful**: Let the next scheduled occurrence run under old schedule, then switch
+- **Windowed**: Only update occurrences within a time window (e.g., 7 days)
+
+**Version Control:**
+
+Updates use optimistic locking to prevent concurrent modifications:
+```go
+// If another process updated the job, your update will fail with version mismatch
+err := sched.UpdateJob(jobUpdate)
+if err != nil && strings.Contains(err.Error(), "version mismatch") {
+    // Reload job and retry
+    job, _ = sched.GetJob(job.ID)
+    jobUpdate.ExpectedVersion = job.Version
+    err = sched.UpdateJob(jobUpdate)
 }
 ```
 

@@ -31,6 +31,7 @@ type Storage interface {
 	ListRunningOccurrences(ctx context.Context) ([]*JobOccurrence, error)
 	ListStaleOccurrences(ctx context.Context, threshold time.Duration) ([]*JobOccurrence, error)
 	ListQueuedOccurrencesByJobID(ctx context.Context, jobID string) ([]*JobOccurrence, error)
+	ListPendingOccurrences(ctx context.Context, jobID string) ([]*JobOccurrence, error)
 	
 	// Task Run operations
 	CreateTaskRun(ctx context.Context, run *TaskRun) error

@@ -104,6 +104,9 @@ func (m *mockStorage) ListStaleOccurrences(ctx context.Context, threshold time.D
 func (m *mockStorage) ListQueuedOccurrencesByJobID(ctx context.Context, jobID string) ([]*storage.JobOccurrence, error) {
 	return nil, nil
 }
+func (m *mockStorage) ListPendingOccurrences(ctx context.Context, jobID string) ([]*storage.JobOccurrence, error) {
+	return nil, nil
+}
 func (m *mockStorage) GetTaskRun(ctx context.Context, runID string) (*storage.TaskRun, error) {
 	return nil, nil
 }

@@ -66,6 +66,15 @@ const (
 	RecoveryStrategyCompressedCatchUp RecoveryStrategy = "Compressed_Catch_Up"
 )
 
+// UpdatePolicy defines how schedule updates should be applied
+type UpdatePolicy string
+
+const (
+	UpdatePolicyImmediate UpdatePolicy = "Immediate"
+	UpdatePolicyGraceful  UpdatePolicy = "Graceful"
+	UpdatePolicyWindowed  UpdatePolicy = "Windowed"
+)
+
 // RetryPolicy defines retry behavior for task execution
 type RetryPolicy struct {
 	MaxRetries     int           `json:"max_retries"`
