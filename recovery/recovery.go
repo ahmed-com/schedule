@@ -8,6 +8,7 @@ import (
 	"github.com/ahmed-com/schedule/concurrency"
 	"github.com/ahmed-com/schedule/executor"
 	"github.com/ahmed-com/schedule/id"
+	"github.com/ahmed-com/schedule/metrics"
 	"github.com/ahmed-com/schedule/storage"
 )
 
@@ -16,6 +17,7 @@ type RecoveryHandler struct {
 	store    storage.Storage
 	executor *executor.Executor
 	pool     *concurrency.WorkerPool
+	metrics  metrics.MetricsCollector
 }
 
 // NewRecoveryHandler creates a new recovery handler
@@ -24,7 +26,13 @@ func NewRecoveryHandler(store storage.Storage, exec *executor.Executor, pool *co
 		store:    store,
 		executor: exec,
 		pool:     pool,
+		metrics:  metrics.NewNoOpMetrics(), // Default to no-op
 	}
+}
+
+// SetMetrics sets the metrics collector for this recovery handler
+func (r *RecoveryHandler) SetMetrics(m metrics.MetricsCollector) {
+	r.metrics = m
 }
 
 // ApplyStrategy applies the configured recovery strategy to missed occurrences
@@ -50,7 +58,7 @@ func (r *RecoveryHandler) ApplyStrategy(ctx context.Context, job *jobistemer.Job
 // executeAll executes all missed occurrences
 func (r *RecoveryHandler) executeAll(ctx context.Context, job *jobistemer.Job, missedTimes []time.Time) error {
 	for _, t := range missedTimes {
-		if err := r.scheduleRecoveryRun(ctx, job, t); err != nil {
+		if err := r.scheduleRecoveryRun(ctx, job, t, "full_backfill"); err != nil {
 			return err
 		}
 	}
@@ -63,7 +71,7 @@ func (r *RecoveryHandler) executeLast(ctx context.Context, job *jobistemer.Job, 
 		return nil
 	}
 	lastTime := missedTimes[len(missedTimes)-1]
-	return r.scheduleRecoveryRun(ctx, job, lastTime)
+	return r.scheduleRecoveryRun(ctx, job, lastTime, "latest_only")
 }
 
 // markAsMissed marks occurrences as missed without executing them
@@ -103,7 +111,7 @@ func (r *RecoveryHandler) boundedWindow(ctx context.Context, job *jobistemer.Job
 }
 
 // scheduleRecoveryRun schedules a recovery run for a specific time
-func (r *RecoveryHandler) scheduleRecoveryRun(ctx context.Context, job *jobistemer.Job, scheduledTime time.Time) error {
+func (r *RecoveryHandler) scheduleRecoveryRun(ctx context.Context, job *jobistemer.Job, scheduledTime time.Time, strategy string) error {
 	occurrenceID := id.GenerateJobOccurrenceID(job.ID, scheduledTime)
 
 	occurrence := &jobistemer.JobOccurrence{
@@ -136,6 +144,9 @@ func (r *RecoveryHandler) scheduleRecoveryRun(ctx context.Context, job *jobistem
 		// Already exists, skip
 		return nil
 	}
+
+	// Track recovery metric
+	r.metrics.IncRecoveryRuns(job.Name, strategy)
 
 	// Submit to worker pool
 	r.pool.Submit(func() {

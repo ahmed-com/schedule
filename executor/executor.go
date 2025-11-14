@@ -9,28 +9,40 @@ import (
 
 	"github.com/ahmed-com/schedule"
 	"github.com/ahmed-com/schedule/id"
+	"github.com/ahmed-com/schedule/metrics"
 	"github.com/ahmed-com/schedule/storage"
 )
 
 // Executor handles the execution of job occurrences and their tasks
 type Executor struct {
-	store storage.Storage
+	store   storage.Storage
+	metrics metrics.MetricsCollector
 }
 
 // NewExecutor creates a new executor instance
 func NewExecutor(store storage.Storage) *Executor {
-	return &Executor{store: store}
+	return &Executor{
+		store:   store,
+		metrics: metrics.NewNoOpMetrics(), // Default to no-op
+	}
+}
+
+// SetMetrics sets the metrics collector for this executor
+func (e *Executor) SetMetrics(m metrics.MetricsCollector) {
+	e.metrics = m
 }
 
 // ExecuteJobOccurrence executes a job occurrence with all its tasks
 func (e *Executor) ExecuteJobOccurrence(ctx context.Context, job *jobistemer.Job, occurrence *jobistemer.JobOccurrence) (*jobistemer.ExecutionReport, error) {
+	startTime := time.Now()
+
 	// Create job-level context with timeout
 	jobCtx, cancel := context.WithTimeout(ctx, job.Config.ExecutionTimeout)
 	defer cancel()
 
 	// Update occurrence status to Running
 	occurrence.Status = jobistemer.JobStatusRunning
-	occurrence.StartTime = timePtr(time.Now())
+	occurrence.StartTime = timePtr(startTime)
 	if err := e.updateOccurrenceStatus(jobCtx, occurrence); err != nil {
 		return nil, err
 	}
@@ -54,13 +66,19 @@ func (e *Executor) ExecuteJobOccurrence(ctx context.Context, job *jobistemer.Job
 	}
 
 	// Update final status
-	occurrence.EndTime = timePtr(time.Now())
+	endTime := time.Now()
+	occurrence.EndTime = &endTime
 	if err != nil {
 		occurrence.Status = jobistemer.JobStatusFailed
 	} else {
 		occurrence.Status = jobistemer.JobStatusCompleted
 	}
 	e.updateOccurrenceStatus(jobCtx, occurrence)
+
+	// Track metrics
+	duration := endTime.Sub(startTime)
+	e.metrics.ObserveJobDuration(job.Name, duration)
+	e.metrics.IncJobOccurrences(job.Name, string(occurrence.Status))
 
 	// Execute OnComplete hook
 	if job.OnComplete != nil {
@@ -299,6 +317,10 @@ func (e *Executor) executeAttempt(ctx context.Context, job *jobistemer.Job, task
 	}
 
 	e.store.UpdateExecutionAttempt(ctx, attempt)
+
+	// Track metrics
+	e.metrics.IncTaskAttempts(job.Name, task.Name, string(attempt.Status))
+	e.metrics.ObserveTaskDuration(job.Name, task.Name, report.Duration)
 
 	return report
 }

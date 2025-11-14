@@ -128,6 +128,9 @@ func (m *mockSchedulerStorage) ListStaleOccurrences(ctx context.Context, thresho
 func (m *mockSchedulerStorage) ListQueuedOccurrencesByJobID(ctx context.Context, jobID string) ([]*storage.JobOccurrence, error) {
 	return nil, nil
 }
+func (m *mockSchedulerStorage) ListPendingOccurrences(ctx context.Context, jobID string) ([]*storage.JobOccurrence, error) {
+	return nil, nil
+}
 func (m *mockSchedulerStorage) GetTaskRun(ctx context.Context, runID string) (*storage.TaskRun, error) {
 	return nil, nil
 }

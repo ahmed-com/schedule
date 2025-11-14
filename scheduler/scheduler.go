@@ -11,18 +11,21 @@ import (
 	"github.com/ahmed-com/schedule/concurrency"
 	"github.com/ahmed-com/schedule/executor"
 	"github.com/ahmed-com/schedule/id"
+	"github.com/ahmed-com/schedule/metrics"
 	"github.com/ahmed-com/schedule/recovery"
 	"github.com/ahmed-com/schedule/storage"
 	"github.com/ahmed-com/schedule/ticker"
+	"github.com/ahmed-com/schedule/update"
 )
 
 // Scheduler is the main orchestrator for job scheduling and execution
 type Scheduler struct {
-	config jobistemer.SchedulerConfig
-	store  storage.Storage
-	exec   *executor.Executor
-	pool   *concurrency.WorkerPool
-	reaper *recovery.Reaper
+	config  jobistemer.SchedulerConfig
+	store   storage.Storage
+	exec    *executor.Executor
+	pool    *concurrency.WorkerPool
+	reaper  *recovery.Reaper
+	metrics metrics.MetricsCollector
 
 	jobs   map[string]*jobistemer.Job
 	jobsMu sync.RWMutex
@@ -43,15 +46,30 @@ func NewScheduler(config jobistemer.SchedulerConfig, store storage.Storage) *Sch
 	pool := concurrency.NewWorkerPool(config.MaxConcurrentJobs)
 	reaper := recovery.NewReaper(store, config.ReaperInterval)
 
+	// Use provided metrics collector or default to NoOp
+	metricsCollector := config.Metrics
+	if metricsCollector == nil {
+		metricsCollector = metrics.NewNoOpMetrics()
+	}
+	// Type assert to ensure it implements MetricsCollector
+	mc, ok := metricsCollector.(metrics.MetricsCollector)
+	if !ok {
+		mc = metrics.NewNoOpMetrics()
+	}
+
+	// Pass metrics to executor
+	exec.SetMetrics(mc)
+
 	return &Scheduler{
-		config: config,
-		store:  store,
-		exec:   exec,
-		pool:   pool,
-		reaper: reaper,
-		jobs:   make(map[string]*jobistemer.Job),
-		ctx:    ctx,
-		cancel: cancel,
+		config:  config,
+		store:   store,
+		exec:    exec,
+		pool:    pool,
+		reaper:  reaper,
+		metrics: mc,
+		jobs:    make(map[string]*jobistemer.Job),
+		ctx:     ctx,
+		cancel:  cancel,
 	}
 }
 
@@ -263,6 +281,7 @@ func (s *Scheduler) performRecovery() error {
 	defer s.jobsMu.RUnlock()
 
 	recoveryHandler := recovery.NewRecoveryHandler(s.store, s.exec, s.pool)
+	recoveryHandler.SetMetrics(s.metrics)
 
 	for _, job := range s.jobs {
 		if !job.Active {
@@ -360,4 +379,110 @@ func (s *Scheduler) ListJobs() []*jobistemer.Job {
 		jobs = append(jobs, job)
 	}
 	return jobs
+}
+
+// updateMetrics updates metrics gauges based on current system state
+func (s *Scheduler) updateMetrics() {
+	// Count running occurrences
+	runningOccs, err := s.store.ListRunningOccurrences(s.ctx)
+	if err == nil {
+		s.metrics.SetJobsRunning(len(runningOccs))
+	}
+
+	// Count queued jobs (jobs in worker pool queue)
+	queueLen := s.pool.QueueLength()
+	s.metrics.SetJobsInQueue(queueLen)
+
+	// Count paused jobs
+	s.jobsMu.RLock()
+	pausedCount := 0
+	for _, job := range s.jobs {
+		if job.Paused {
+			pausedCount++
+		}
+	}
+	s.jobsMu.RUnlock()
+	s.metrics.SetJobsPaused(pausedCount)
+}
+
+// UpdateJob updates a registered job with version checking
+func (s *Scheduler) UpdateJob(jobUpdate *update.JobUpdate) error {
+	s.jobsMu.Lock()
+	defer s.jobsMu.Unlock()
+
+	// Check if job exists
+	job, exists := s.jobs[jobUpdate.JobID]
+	if !exists {
+		return fmt.Errorf("job not registered: %s", jobUpdate.JobID)
+	}
+
+	// Verify version matches
+	if job.Version != jobUpdate.ExpectedVersion {
+		return fmt.Errorf("version mismatch: expected %d, got %d", jobUpdate.ExpectedVersion, job.Version)
+	}
+
+	// Create update manager
+	updateMgr := update.NewUpdateManager(s.store)
+
+	// Apply update through update manager
+	if err := updateMgr.ApplyUpdate(s.ctx, jobUpdate); err != nil {
+		return fmt.Errorf("failed to apply update: %w", err)
+	}
+
+	// Update in-memory job if config was changed
+	if jobUpdate.NewConfig != nil {
+		job.Config = *jobUpdate.NewConfig
+	}
+
+	// Update ticker if provided
+	if jobUpdate.NewTicker != nil {
+		// Stop old ticker
+		if job.Ticker != nil {
+			job.Ticker.Stop()
+		}
+		// Set new ticker
+		job.Ticker = jobUpdate.NewTicker
+		// Restart if job is active
+		if job.Active && !job.Paused && s.running {
+			job.Ticker.Start()
+		}
+	}
+
+	// Apply task updates
+	taskMap := make(map[string]*jobistemer.Task)
+	for _, task := range job.Tasks {
+		taskMap[task.ID] = task
+	}
+
+	// Add new tasks
+	for _, task := range jobUpdate.AddedTasks {
+		job.Tasks = append(job.Tasks, task)
+		taskMap[task.ID] = task
+	}
+
+	// Remove tasks
+	for _, taskID := range jobUpdate.RemovedTaskIDs {
+		delete(taskMap, taskID)
+	}
+
+	// Update tasks
+	for _, updatedTask := range jobUpdate.UpdatedTasks {
+		if existingTask, exists := taskMap[updatedTask.ID]; exists {
+			existingTask.Name = updatedTask.Name
+			existingTask.Config = updatedTask.Config
+			existingTask.Order = updatedTask.Order
+		}
+	}
+
+	// Rebuild tasks list from map
+	newTasks := make([]*jobistemer.Task, 0, len(taskMap))
+	for _, task := range taskMap {
+		newTasks = append(newTasks, task)
+	}
+	job.Tasks = newTasks
+
+	// Increment version
+	job.Version++
+
+	return nil
 }
