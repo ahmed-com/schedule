@@ -2,227 +2,398 @@
 
 ## Project Overview
 
-Jobistemer is a Go library for scheduling and executing jobs composed of multiple tasks. It provides persistent, fault-tolerant execution of recurring jobs with the following key characteristics:
+Jobistemer is a production-ready Go library for distributed job scheduling with persistent, fault-tolerant execution. It solves three critical distributed systems problems through architectural design rather than band-aid fixes:
 
-- **Backend-agnostic design**: Supports pluggable storage layers (example implementation uses BadgerDB)
-- **Distributed coordination**: Lock-free coordination using deterministic IDs
-- **Fault-tolerant execution**: Persistent state with atomic transactional operations
-- **Hierarchical job model**: Jobs → Tasks → Job Occurrences → Task Runs → Execution Attempts
+1. **Job Overlap** - Prevents self-overlapping runs via persistent state tracking
+2. **Distributed Locking** - Lock-free coordination using deterministic IDs (no TTL leases)
+3. **Parallel Task Execution** - Coordinated fan-out with failure handling
 
-### Core Design Principles
+### Core Architecture (The "Why" Behind Everything)
 
-1. **Deterministic Idempotency**: All entities use deterministically generated IDs (e.g., UUIDv5) to ensure idempotent operations across distributed nodes
-2. **Atomic, Transactional Persistence**: State is moved from ephemeral in-memory flags to permanent, transactional database records
-3. **Hierarchical Data Model**: Clear separation between Jobs, Tasks, Job Occurrences, Task Runs, and Execution Attempts
+**Deterministic Idempotency**: Every entity ID is derived from stable context (UUIDv5):
+- `JobOccurrenceID = UUIDv5(JobID, ScheduledTimestamp)` - multiple nodes compute identical IDs
+- Race to create occurrence in DB - first write wins, others get "already exists" (expected, not error)
+- No separate lock entity, no TTL expiration, no clock skew issues
 
-## Architecture Guidelines
-
-### Key Problems Addressed
-
-1. **Job Overlap**: Prevention of self-overlapping job runs using persistent state tracking
-2. **Distributed Locking**: Lock-free coordination via deterministic Job Occurrence IDs
-3. **Parallel Task Execution**: Fan-out execution with coordinated failure handling using `sync.WaitGroup` and `context.WithCancel`
-
-### Entity Hierarchy
-
-When implementing code, respect this hierarchy:
-
+**Hierarchical State Model** (this structure solves the problems):
 ```
-Job (recurring schedule definition)
-  └── Task (unit of work within a job)
-       └── Job Occurrence (single trigger of job's schedule)
-            └── Task Run (execution record for a task)
-                 └── Execution Attempt (individual try, including retries)
+Job (schedule definition)
+  └─ Task (unit of work)
+      └─ JobOccurrence (single trigger = the "distributed lock")
+          └─ TaskRun (execution record for task)
+              └─ ExecutionAttempt (individual try with retries)
 ```
 
-### Deterministic ID Generation
+**Why this matters**: Without `JobOccurrence` as distinct entity, distributed coordination fails. It's the persistent record that IS the lock.
 
-- **Job Occurrence ID**: `UUIDv5(JobID, ScheduledTimestamp)`
-- **Execution Attempt ID**: Based on Task Run ID and attempt number
-- Always use deterministic ID generation for distributed coordination
+## Critical Implementation Patterns
 
-### Storage Layer
+### ID Generation (Package: `id/`)
 
-- Implement backend-agnostic persistence using interface abstractions
-- Support atomic "create-if-not-exists" operations (UNIQUE constraints)
-- Use hierarchical key schema for key-value stores:
-  ```
-  job/<JobID>
-  job/<JobID>/task/<TaskID>
-  job/<JobID>/occurrence/<OccurID>
-  job/<JobID>/occurrence/<OccurID>/task/<TaskID>/run
-  job/<JobID>/occurrence/<OccurID>/task/<TaskID>/run/attempt/<AttemptID>
-  ```
+**All IDs MUST be deterministic** - see `id/id.go` for canonical patterns:
 
-## Go Coding Standards
+```go
+// Job occurrence - THIS is the distributed lock
+occID := id.GenerateJobOccurrenceID(jobID, scheduledTime)
+// Uses UTC RFC3339 format for time consistency
 
-### General Conventions
+// Task run
+runID := id.GenerateTaskRunID(occurrenceID, taskID)
 
-- Follow standard Go formatting (use `gofmt` or `goimports`)
-- Use Go 1.22+ features where appropriate
-- Write idiomatic Go code following effective Go principles
-- Keep functions small and focused on a single responsibility
+// Execution attempt
+attemptID := id.GenerateExecutionAttemptID(taskRunID, attemptNumber)
+```
 
-### Concurrency Patterns
+**Critical rule**: Never use `uuid.New()` or auto-increment for coordination entities. Random IDs break distributed idempotency.
 
-- Use `context.WithDeadline` for job execution timeouts
-- Use `context.WithCancel` for coordinating parallel task cancellation
-- Use `sync.WaitGroup` for managing parallel task execution
-- Always respect context cancellation in long-running operations
-- Avoid in-memory flags for distributed state - use persistent records instead
+### Storage Interface (Package: `storage/`)
 
-### Error Handling
+**The contract that enables everything**:
 
-- Return errors explicitly, don't panic except for truly unrecoverable situations
-- Wrap errors with context using `fmt.Errorf` with `%w` verb
-- Log errors at appropriate levels with structured logging
-- Preserve full error chains for debugging
+```go
+// Atomic create-if-not-exists - rejects duplicates (expected behavior)
+CreateJobOccurrence(ctx, occurrence) error
 
-### Interfaces and Abstractions
+// Query primitives for coordination
+ListRunningOccurrences(ctx) ([]*JobOccurrence, error)
+ListStaleOccurrences(ctx, threshold) ([]*JobOccurrence, error)
+```
 
-- Design interfaces to be minimal and focused
-- Support pluggable implementations (storage backends, schedulers, etc.)
-- Use dependency injection for testability
-- Key interfaces to implement:
-  - **Ticker**: Scheduling strategy (Cron, ISO8601, Once, custom)
-  - **Storage**: Persistence layer abstraction
-  - **Task**: Unit of work interface
+**Implementation notes**:
+- BadgerDB: Use `txn.Get()` check before `txn.Set()` in same transaction
+- SQL: Use UNIQUE constraint + INSERT (let DB reject duplicates)
+- Hierarchical keys: `job/{jobID}/occurrence/{occID}/...` enables prefix queries
 
-### Naming Conventions
+## Execution Flow (Package: `executor/`, `scheduler/`)
 
-- Use clear, descriptive names that reflect the entity hierarchy
-- Prefix interface names with 'I' only if it adds clarity (prefer simple names)
-- Use PascalCase for exported identifiers
-- Use camelCase for unexported identifiers
+### The Race-to-Create Pattern (Distributed Lock)
 
-## Testing Requirements
+From `scheduler/scheduler.go:handleJobTrigger()`:
 
-### Test Coverage
+```go
+// 1. All nodes compute SAME ID independently
+occurrenceID := id.GenerateJobOccurrenceID(job.ID, execCtx.ScheduledTime)
 
-- Aim for high test coverage, especially for:
-  - Deterministic ID generation
-  - Concurrent execution scenarios
-  - Failure and retry logic
-  - Storage layer operations
+// 2. Atomic create attempt
+err := s.store.CreateJobOccurrence(ctx, storageOcc)
+if err != nil {
+    // Another node won - this is EXPECTED, not an error
+    return  // Gracefully exit
+}
 
-### Test Types
+// 3. Winner proceeds with execution
+s.pool.Submit(func() {
+    s.exec.ExecuteJobOccurrence(ctx, job, occurrence)
+})
+```
 
-1. **Unit Tests**: Test individual components in isolation
-   - Mock dependencies using interfaces
-   - Test edge cases and error conditions
-   - Verify deterministic behavior
+**Never**:
+- Use in-memory `running` bool - multiple nodes won't see it
+- Create random occurrence IDs - breaks race-to-create pattern
+- Log duplicate rejection as error - it's expected distributed behavior
 
-2. **Integration Tests**: Test component interactions
-   - Test with actual storage backends
-   - Verify distributed coordination scenarios
-   - Test failure recovery mechanisms
+### Parallel Execution with Fail-Fast
 
-3. **Concurrency Tests**: Test parallel execution
-   - Use `-race` flag to detect race conditions
-   - Test `sync.WaitGroup` coordination
-   - Verify context cancellation propagation
+From `executor/executor.go:executeParallel()`:
 
-### Test Organization
+```go
+groupCtx, cancel := context.WithCancel(ctx)
+defer cancel()
 
-- Place tests in `_test.go` files alongside source files
-- Use table-driven tests for multiple scenarios
-- Use subtests with `t.Run()` for better organization
-- Include benchmarks for performance-critical code
+var wg sync.WaitGroup
+for _, task := range job.Tasks {
+    wg.Add(1)
+    go func(t *Task) {
+        defer wg.Done()
+        
+        taskReport := e.executeTask(groupCtx, job, t, occurrence)
+        
+        if taskReport.FinalStatus == TaskStatusFailed {
+            if strategy == FailureStrategyFailFast {
+                cancel() // Signals all other goroutines
+            }
+        }
+    }(task)
+}
+wg.Wait()
+```
 
-## Feature Implementation Guidelines
+**Key pattern**: `context.WithCancel` + `sync.WaitGroup` provides coordinated fan-out/fan-in.
 
-### Implementing a New Ticker
+### Config Cascading (The CSS Model)
 
-1. Implement the Ticker interface methods:
-   - Start(), Stop(), Pause(), Resume()
-   - IsActive(), IsPaused(), IsEnabled(), IsRunning(), NextRun()
-   - Provide a read-only channel for execution contexts
+From `job.go:GetEffectiveConfig()`:
 
-2. Handle time zones correctly (see timezone considerations in spec)
-3. Respect startTime and endTime boundaries
-4. Support persistence of ticker state
+```go
+effective := j.Config.TaskConfig  // Start with job defaults
 
-### Implementing Task Execution
+// Task-specific overrides (pointer = optional)
+if task.Config.FailureStrategy != nil {
+    effective.FailureStrategy = task.Config.FailureStrategy
+}
+if task.Config.RetryPolicy != nil {
+    effective.RetryPolicy = task.Config.RetryPolicy
+}
+```
 
-1. Tasks run in isolated execution contexts (separate DB transactions)
-2. Support both sequential and parallel execution modes
-3. Implement failure strategies:
-   - **Fail-Fast**: Cancel remaining tasks on first failure
-   - **Continue**: Execute all tasks regardless of failures
-4. Generate execution reports with full audit trail
-5. Support retry policies with configurable backoff
-
-### Implementing Storage Backend
-
-1. Implement atomic "create-if-not-exists" semantics
-2. Support efficient retrieval by key or key prefix
-3. Provide transaction support for atomic operations
-4. Handle concurrent access gracefully
-5. Implement proper cleanup/garbage collection for old records
+**Rule**: Use pointer fields (`*time.Duration`, `*RetryPolicy`) to distinguish "not set" from "set to zero value".
 
 ## Development Workflow
 
-### Before Starting Work
+### Running Tests
 
-1. Review the technical specification in README.md
-2. Understand the entity hierarchy and relationships
-3. Identify which interfaces need to be implemented or extended
+```bash
+# All tests with race detection
+go test -race ./...
 
-### Code Changes
+# Specific package
+go test -race ./id
 
-1. Make minimal, focused changes
-2. Ensure backward compatibility unless explicitly breaking
-3. Update documentation for API changes
-4. Add or update tests to cover new functionality
+# Run demo
+go run examples/phase1-3-demo.go
 
-### Documentation
+# Build verification
+go build ./...
+```
 
-- Document all exported types, functions, and methods with clear godoc comments
-- Include usage examples in documentation
-- Update README.md for significant architectural changes
-- Document any deviation from the specification with rationale
+### Test Patterns (See `*_test.go` files)
 
-### Commit Messages
+**Determinism tests** (`id/id_test.go`):
+```go
+func TestIDDeterminismAcrossRuns(t *testing.T) {
+    // Generate same ID twice - MUST be identical
+    id1 := id.GenerateJobOccurrenceID(jobID, time1)
+    id2 := id.GenerateJobOccurrenceID(jobID, time1)
+    if id1 != id2 {
+        t.Error("IDs not deterministic")
+    }
+}
+```
 
-- Use conventional commit format: `type(scope): description`
-- Types: feat, fix, docs, test, refactor, perf, chore
-- Include issue references where applicable
+**Concurrency tests** (`concurrency/pool_test.go`):
+```go
+func TestWorkerPoolConcurrencyLimit(t *testing.T) {
+    // Use channels + sync primitives to verify max workers
+    concurrent := &atomic.Int32{}
+    // ... verify never exceeds pool.maxWorkers
+}
+```
 
-## Time Zone and DST Considerations
+**Table-driven tests** (common pattern):
+```go
+tests := []struct {
+    name string
+    input X
+    want Y
+}{
+    {"case1", x1, y1},
+    {"case2", x2, y2},
+}
+for _, tt := range tests {
+    t.Run(tt.name, func(t *testing.T) {
+        // test logic
+    })
+}
+```
 
-- Always use timezone-aware time handling
-- Consider DST transitions in cron schedules
-- Document timezone behavior clearly
-- Test with various timezones including edge cases
+## Package Organization & Key Files
 
-## Performance Considerations
+```
+jobistemer/                      # Root package - core types
+├── types.go                     # Status enums, configs, reports
+├── job.go                       # Job/Task definitions, GetEffectiveConfig()
+├── id/                          # Deterministic ID generation
+│   └── id.go                    # UUIDv5-based ID functions
+├── storage/                     # Storage abstraction
+│   ├── storage.go               # Storage interface (THE contract)
+│   └── badger/                  # BadgerDB implementation
+│       └── badger.go            # Hierarchical key schema
+├── ticker/                      # Scheduling strategies
+│   ├── ticker.go                # Ticker interface
+│   ├── cron.go                  # Cron expression support
+│   ├── iso8601.go               # ISO8601 intervals
+│   └── once.go                  # One-time execution
+├── scheduler/                   # Main orchestrator
+│   └── scheduler.go             # Job registration, trigger handling
+├── executor/                    # Execution engine
+│   └── executor.go              # Sequential/parallel execution
+├── concurrency/                 # Worker pool (thundering herd protection)
+│   └── pool.go                  # Bounded concurrent execution
+├── recovery/                    # OnBoot recovery & reaper
+│   ├── recovery.go              # RecoveryStrategy implementations
+│   └── reaper.go                # Stale occurrence cleanup
+├── metrics/                     # Observability
+│   └── metrics.go               # MetricsCollector interface
+└── update/                      # Job versioning & updates
+    └── update.go                # UpdateManager, diffing logic
+```
 
-- Minimize database round-trips using batch operations
-- Use connection pooling for storage backends
-- Implement efficient key prefix scanning for hierarchical queries
-- Consider memory usage for long-running schedulers
-- Profile and benchmark performance-critical paths
+**Where to start**:
+- Adding storage backend? → Implement `storage/storage.go` interface
+- New ticker strategy? → Implement `ticker/ticker.go` interface
+- Understanding execution? → Read `executor/executor.go:executeParallel()`
+- Debugging coordination? → Check `scheduler/scheduler.go:handleJobTrigger()`
 
-## Security Considerations
+## Common Modification Patterns
 
-- Validate all user inputs (cron expressions, intervals, etc.)
-- Prevent resource exhaustion (limit concurrent tasks, execution timeouts)
-- Secure credential handling for storage backends
-- Implement proper access controls if exposing APIs
-- Audit log security-relevant events
+### Adding a New Ticker Type
 
-## Common Pitfalls to Avoid
+```go
+// 1. Create new file: ticker/mythicker.go
+type MyTicker struct {
+    // config fields
+    ch chan ticker.ExecutionContext
+}
 
-1. **Don't use in-memory state for distributed coordination** - Always use persistent, deterministic records
-2. **Don't use non-deterministic IDs** - Use UUIDv5 or similar deterministic schemes
-3. **Don't ignore context cancellation** - Always respect context in long-running operations
-4. **Don't overwrite execution history** - Preserve full audit trail (separate Execution Attempts)
-5. **Don't assume single-process execution** - Design for distributed, multi-node scenarios
-6. **Don't use short-lived lease keys** - Use transactional, persistent state instead
+// 2. Implement Ticker interface (11 methods)
+func (t *MyTicker) Start() error { /* ... */ }
+func (t *MyTicker) NextRun() (time.Time, error) { /* ... */ }
+// ... implement all from ticker.go
 
-## References
+// 3. Add GetOccurrencesBetween for recovery support
+func (t *MyTicker) GetOccurrencesBetween(start, end time.Time) ([]time.Time, error) {
+    // Critical: must return ALL occurrences in range
+}
 
-- Full technical specification: See README.md
-- Go best practices: https://go.dev/doc/effective_go
-- Context package: https://pkg.go.dev/context
-- Time handling: https://pkg.go.dev/time
+// 4. Test determinism and recovery
+```
+
+### Adding a Storage Backend
+
+```go
+// 1. Create storage/mydb/mydb.go
+type MyDBStorage struct {
+    conn *sql.DB
+}
+
+// 2. Implement ALL storage.Storage methods (35 methods!)
+func (s *MyDBStorage) CreateJobOccurrence(ctx, occ) error {
+    // CRITICAL: Use UNIQUE constraint on ID
+    _, err := s.conn.ExecContext(ctx, 
+        "INSERT INTO job_occurrences (id, ...) VALUES (?, ...)",
+        occ.ID, ...)
+    // Duplicate key error = expected, not failure
+    return err
+}
+
+// 3. Hierarchical queries for prefix scans
+func (s *MyDBStorage) ListTaskRunsByOccurrenceID(ctx, occID) {
+    // WHERE id LIKE 'occ_abc%' equivalent
+}
+```
+
+### Extending Config Options
+
+```go
+// 1. Add to types.go
+type JobConfig struct {
+    // existing fields...
+    MyNewOption *MyOptionType `json:"my_new_option,omitempty"`
+}
+
+// 2. Update GetEffectiveConfig in job.go
+func (j *Job) GetEffectiveConfig(task *Task) TaskConfig {
+    effective := j.Config.TaskConfig
+    if task.Config.MyNewOption != nil {
+        effective.MyNewOption = task.Config.MyNewOption
+    }
+    return effective
+}
+
+// 3. Use in executor.go
+config := job.GetEffectiveConfig(task)
+if config.MyNewOption != nil {
+    // Apply option
+}
+```
+
+## Critical Anti-Patterns (DO NOT DO)
+
+### ❌ Random IDs for Coordination Entities
+```go
+// WRONG - breaks distributed idempotency
+occurrenceID := uuid.New().String()
+```
+```go
+// CORRECT - deterministic from context
+occurrenceID := id.GenerateJobOccurrenceID(jobID, scheduledTime)
+```
+
+### ❌ In-Memory "Lock" State
+```go
+// WRONG - other nodes can't see this
+var jobRunning bool
+if !jobRunning {
+    jobRunning = true
+    execute()
+}
+```
+```go
+// CORRECT - persistent query
+isRunning, _ := job.IsRunning(ctx, store.ListRunningOccurrences)
+if isRunning && policy == OverlapPolicySkip {
+    return  // Skip
+}
+```
+
+### ❌ Treating Duplicate Creation as Error
+```go
+// WRONG - logs noise, breaks distributed pattern
+err := store.CreateJobOccurrence(ctx, occ)
+if err != nil {
+    log.Error("FAILED to create occurrence") // NO!
+    return err
+}
+```
+```go
+// CORRECT - graceful exit when another node won
+err := store.CreateJobOccurrence(ctx, occ)
+if err != nil {
+    // Another node won the race - this is EXPECTED
+    return  // Silent exit, no error propagation
+}
+```
+
+### ❌ Execution Timeout = Schedule Frequency
+```go
+// WRONG - couples unrelated concerns
+interval := ticker.GetInterval()
+ctx, _ := context.WithTimeout(ctx, interval)
+```
+```go
+// CORRECT - explicit, independent timeout
+ctx, _ := context.WithTimeout(ctx, job.Config.ExecutionTimeout)
+```
+
+### ❌ Overwriting Execution Attempts
+```go
+// WRONG - loses retry history
+attempt.Status = "Failed"
+store.UpdateExecutionAttempt(ctx, attempt)
+// Next retry overwrites same record
+```
+```go
+// CORRECT - new attempt per try
+for attemptNum := 0; attemptNum <= maxRetries; attemptNum++ {
+    attemptID := id.GenerateExecutionAttemptID(runID, attemptNum)
+    attempt := &ExecutionAttempt{ID: attemptID, ...}
+    store.CreateExecutionAttempt(ctx, attempt)
+}
+```
+
+## Quick Reference Card
+
+**When coordinating across nodes**: Use deterministic IDs + atomic create (race-to-win)  
+**When handling task failure**: Check RetryPolicy first, then FailureStrategy  
+**When adding config field**: Use pointer type for optional override  
+**When implementing Storage**: Rejection of duplicate keys MUST be supported  
+**When testing concurrency**: Always run with `-race` flag  
+**When debugging "stuck" job**: Check reaper interval and ExecutionTimeout  
+
+**Most important files to understand**:
+1. `id/id.go` - How IDs enable coordination
+2. `scheduler/scheduler.go:handleJobTrigger()` - The race-to-create pattern
+3. `executor/executor.go:executeParallel()` - Fail-fast coordination
+4. `storage/storage.go` - The storage contract
+
+**See `README.md` for complete technical specification and rationale.**
